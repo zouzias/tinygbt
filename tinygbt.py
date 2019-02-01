@@ -1,5 +1,5 @@
-#!/usr/bin/python
-'''
+# -*- coding: utf-8 -*-
+"""
     File name: tinygbt.py
     Author: Seong-Jin Kim
     EMail: lancifollia@gmail.com
@@ -7,10 +7,13 @@
     Reference:
         [1] T. Chen and C. Guestrin. XGBoost: A Scalable Tree Boosting System. 2016.
         [2] G. Ke et al. LightGBM: A Highly Efficient Gradient Boosting Decision Tree. 2017.
-'''
+"""
 
 import sys
 import time
+import logging
+import numpy as np
+from joblib import Parallel, delayed
 try:
     # For python2
     from itertools import izip as zip
@@ -19,7 +22,22 @@ except ImportError:
     # For python3
     LARGE_NUMBER = sys.maxsize
 
-import numpy as np
+NUM_THREADS = 12  # Number of processes
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+
+class Gain(object):
+    def __init__(self, best_gain, best_val, best_left_instance_ids,
+                 best_right_instance_ids):
+        self.best_gain = best_gain
+        self.best_val = best_val
+        self.best_left_instance_ids = best_left_instance_ids
+        self.best_right_instance_ids = best_right_instance_ids
+
+    def __repr__(self):
+        return "gain:{}/val:{}".format(self.best_gain, self.best_val)
 
 
 class Dataset(object):
@@ -37,7 +55,8 @@ class TreeNode(object):
         self.split_val = None
         self.weight = None
 
-    def _calc_split_gain(self, G, H, G_l, H_l, G_r, H_r, lambd):
+    @staticmethod
+    def _calc_split_gain(G, H, G_l, H_l, G_r, H_r, lambd):
         """
         Loss reduction
         (Refer to Eq7 of Reference[1])
@@ -46,65 +65,87 @@ class TreeNode(object):
             return np.square(g) / (h + lambd)
         return calc_term(G_l, H_l) + calc_term(G_r, H_r) - calc_term(G, H)
 
-    def _calc_leaf_weight(self, grad, hessian, lambd):
+    @staticmethod
+    def _calc_leaf_weight(grad, hessian, lambd):
         """
         Calculate the optimal weight of this leaf node.
         (Refer to Eq5 of Reference[1])
         """
         return np.sum(grad) / (np.sum(hessian) + lambd)
 
-    def build(self, instances, grad, hessian, shrinkage_rate, depth, param):
-        """
-        Exact Greedy Alogirithm for Split Finidng
-        (Refer to Algorithm1 of Reference[1])
-        """
-        assert instances.shape[0] == len(grad) == len(hessian)
-        if depth > param['max_depth']:
-            self.is_leaf = True
-            self.weight = self._calc_leaf_weight(grad, hessian, param['lambda']) * shrinkage_rate
-            return
-        G = np.sum(grad)
-        H = np.sum(hessian)
+    def opt_gain_by_feature(self, instances, feature_id, grad, hessian, lambd):
+        G, H = np.sum(grad), np.sum(hessian)
+        G_l, H_l = 0., 0.
         best_gain = 0.
-        best_feature_id = None
         best_val = 0.
         best_left_instance_ids = None
         best_right_instance_ids = None
-        for feature_id in range(instances.shape[1]):
-            G_l, H_l = 0., 0.
-            sorted_instance_ids = instances[:,feature_id].argsort()
-            for j in range(sorted_instance_ids.shape[0]):
-                G_l += grad[sorted_instance_ids[j]]
-                H_l += hessian[sorted_instance_ids[j]]
-                G_r = G - G_l
-                H_r = H - H_l
-                current_gain = self._calc_split_gain(G, H, G_l, H_l, G_r, H_r, param['lambda'])
-                if current_gain > best_gain:
-                    best_gain = current_gain
-                    best_feature_id = feature_id
-                    best_val = instances[sorted_instance_ids[j]][feature_id]
-                    best_left_instance_ids = sorted_instance_ids[:j+1]
-                    best_right_instance_ids = sorted_instance_ids[j+1:]
+        sorted_instance_ids = instances[:, feature_id].argsort()
+        for j in range(sorted_instance_ids.shape[0]):
+            G_l += grad[sorted_instance_ids[j]]
+            H_l += hessian[sorted_instance_ids[j]]
+            G_r = G - G_l
+            H_r = H - H_l
+            current_gain = self._calc_split_gain(G, H, G_l, H_l, G_r, H_r, lambd)
+            if current_gain > best_gain:
+                best_gain = current_gain
+                best_val = instances[sorted_instance_ids[j]][feature_id]
+                best_left_instance_ids = sorted_instance_ids[:j + 1]
+                best_right_instance_ids = sorted_instance_ids[j + 1:]
+
+        return Gain(best_gain, best_val, best_left_instance_ids, best_right_instance_ids)
+
+    def build(self, instances, grad, hessian, shrinkage_rate, depth, param):
+        """
+        Exact Greedy Alogirithm for Split Finding
+        (Refer to Algorithm1 of Reference[1])
+        """
+        assert instances.shape[0] == len(grad) == len(hessian)
+        lambd = param["lambda"]
+
+        if depth > param['max_depth']:
+            self.is_leaf = True
+            self.weight = self._calc_leaf_weight(grad, hessian, lambd) * shrinkage_rate
+            return
+
+        gains = Parallel(n_jobs=NUM_THREADS)([delayed(self.opt_gain_by_feature)(instances,
+                                                                                feature_id,
+                                                                                grad,
+                                                                                hessian,
+                                                                                lambd)
+                                           for feature_id in range(instances.shape[1])])
+
+        best_gain = 0.
+        best_feature_id = None
+        for idx, g in enumerate(gains):
+            if g.best_gain >= best_gain:
+                best_gain = g.best_gain
+                best_feature_id = idx
+
+        best = gains[best_feature_id]
+
         if best_gain < param['min_split_gain']:
             self.is_leaf = True
-            self.weight = self._calc_leaf_weight(grad, hessian, param['lambda']) * shrinkage_rate
+            self.weight = self._calc_leaf_weight(grad, hessian, lambd) * shrinkage_rate
         else:
             self.split_feature_id = best_feature_id
-            self.split_val = best_val
+            self.split_val = best.best_val
 
             self.left_child = TreeNode()
-            self.left_child.build(instances[best_left_instance_ids],
-                                  grad[best_left_instance_ids],
-                                  hessian[best_left_instance_ids],
+            self.left_child.build(instances[best.best_left_instance_ids],
+                                  grad[best.best_left_instance_ids],
+                                  hessian[best.best_left_instance_ids],
                                   shrinkage_rate,
-                                  depth+1, param)
+                                  depth + 1,
+                                  param)
 
             self.right_child = TreeNode()
-            self.right_child.build(instances[best_right_instance_ids],
-                                   grad[best_right_instance_ids],
-                                   hessian[best_right_instance_ids],
+            self.right_child.build(instances[best.best_right_instance_ids],
+                                   grad[best.best_right_instance_ids],
+                                   hessian[best.best_right_instance_ids],
                                    shrinkage_rate,
-                                   depth+1, param)
+                                   depth + 1,
+                                   param)
 
     def predict(self, x):
         if self.is_leaf:
@@ -140,6 +181,7 @@ class GBT(object):
                        'learning_rate': 0.3,
                        }
         self.best_iteration = None
+        self.models = None
 
     def _calc_training_data_scores(self, train_set, models):
         if len(models) == 0:
@@ -199,19 +241,19 @@ class GBT(object):
             train_loss = self._calc_loss(models, train_set)
             val_loss = self._calc_loss(models, valid_set) if valid_set else None
             val_loss_str = '{:.10f}'.format(val_loss) if val_loss else '-'
-            print("Iter {:>3}, Train's L2: {:.10f}, Valid's L2: {}, Elapsed: {:.2f} secs"
+            logger.info("Iter {:>3}, Train's L2: {:.10f}, Valid's L2: {}, Elapsed: {:.2f} secs"
                   .format(iter_cnt, train_loss, val_loss_str, time.time() - iter_start_time))
             if val_loss is not None and val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_iteration = iter_cnt
             if iter_cnt - best_iteration >= early_stopping_rounds:
-                print("Early stopping, best iteration is:")
-                print("Iter {:>3}, Train's L2: {:.10f}".format(best_iteration, best_val_loss))
+                logger.info("Early stopping, best iteration is:")
+                logger.info("Iter {:>3}, Train's L2: {:.10f}".format(best_iteration, best_val_loss))
                 break
 
         self.models = models
         self.best_iteration = best_iteration
-        print("Training finished. Elapsed: {:.2f} secs".format(time.time() - train_start_time))
+        logger.info("Training finished. Elapsed: {:.2f} secs".format(time.time() - train_start_time))
 
     def predict(self, x, models=None, num_iteration=None):
         if models is None:
